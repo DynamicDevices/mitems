@@ -39,7 +39,8 @@ SSD1306 display (OLED_I2C_ADDR, OLED_SDA, OLED_SCL);
 #endif
 
 #define uS_TO_S_FACTOR 1000000  /* Conversion factor for micro seconds to seconds */
-#define TIME_TO_SLEEP  5*60     /* Time ESP32 will go to sleep (in seconds) */
+//#define TIME_TO_SLEEP  5*60     /* Time ESP32 will go to sleep (in seconds) */
+#define TIME_TO_SLEEP  5     /* Time ESP32 will go to sleep (in seconds) */
 
 // I2C code
 
@@ -117,6 +118,9 @@ bool setupOTA(const char *ssid, const char *pass)
 // SLEEP
 void gotosleep()
 {
+    // Debug delay
+    delay(5000);
+
     // Wake up on sleep timer
     esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
 
@@ -261,6 +265,9 @@ void onEvent (ev_t ev) {
 
               _isJoined = true;
 
+              // TTN uses SF9 for its RX2 window.
+              LMIC.dn2Dr = DR_SF9;
+
               // Copy across our structure to NVRAM backed storage
               memcpy( (void *)&_lmic, (const void *)&LMIC, sizeof(LMIC));
 
@@ -375,13 +382,13 @@ void setup() {
     // Disable link check validation
     LMIC_setLinkCheckMode(0);
 
-    // TTN uses SF9 for its RX2 window.
-    LMIC.dn2Dr = DR_SF9;
+    // TTN uses SF9 for its RX2 window - setting this in LMIC layer
+    //LMIC.dn2Dr = DR_SF9;
 
     // Set data rate and transmit power for uplink (note: txpow seems to be ignored by the library)
     //LMIC_setDrTxpow(DR_SF11,14);
-    //  LMIC_setDrTxpow(DR_SF9,14);
-    LMIC_setDrTxpow(DR_SF12,14);
+    LMIC_setDrTxpow(DR_SF7,14);
+    //LMIC_setDrTxpow(DR_SF12,14);
 
     if(_isJoined)
     {
@@ -391,7 +398,8 @@ void setup() {
     }
 
     // Start job
-    do_send(&sendjob);     // Will fire up also the join
+    do_send(&sendjob);     // Will fire up also the join - NOTE: that the LMIC layer seems to always join on SF7 by default. Not sure why this is. Modified LMIC to SF9...
+
     //LMIC_startJoining();
 }
 
