@@ -10,9 +10,7 @@
 //#include <SSD1306.h>
 #include <Wifi.h>
 #include "driver/rtc_io.h"
-
-const char* ssid = "phone";
-const char* password = "";
+#include "SecureOTA.h"
 
 #define LEDPIN 2
 #define BUTTONPIN 0
@@ -22,6 +20,10 @@ const char* password = "";
 #define OLED_RESET 16
 #define OLED_SDA 4
 #define OLED_SCL 15
+
+const uint16_t OTA_CHECK_INTERVAL = 3000; // ms
+uint32_t _lastOTACheck = 0;
+bool _bCheckForOTA = false;
 
 unsigned int counter = 0;
 char TTN_response[30];
@@ -58,7 +60,7 @@ static const u1_t PROGMEM APPEUI[8]={ 0x1A, 0x5A, 0x01, 0xD0, 0x7E, 0xD5, 0xB3, 
 void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
 
 static u1_t PROGMEM DEVEUI[8]={ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };   // LSB mode
-void os_getDevEui (u1_t* buf) { 
+void os_getDevEui (u1_t* buf) {
     memcpy_P(buf,(const void *)DEVEUI, 8);
 }
 
@@ -86,10 +88,72 @@ const lmic_pinmap lmic_pins = {
 
 char _buff[80];
 
+/**
+ * Initialise Wifi to check for OTA
+ * 
+ * TODO: Add connection timeout
+ */
+bool setupOTA(const char *ssid, const char *pass)
+{
+  Serial.print("Device version: v.");
+  Serial.println(VERSION);
+  Serial.print("Connecting to " + String(ssid));
+
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println(" connected!");
+  _lastOTACheck = millis();
+
+  return true;
+}
+
+// END OTA
+
+// SLEEP
+void gotosleep()
+{
+    // Wake up on sleep timer
+    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+
+    // Wake up on switch change
+    {
+        int switchValue = digitalRead(SWITCHPIN);
+        bool state = switchValue == 1;
+
+        if(state)
+        {
+            // Wake on change to OFF
+            esp_sleep_enable_ext0_wakeup(GPIO_NUM_13,0);
+            rtc_gpio_pulldown_dis( GPIO_NUM_13);
+            rtc_gpio_pullup_en( GPIO_NUM_13);
+        }
+        else
+        {
+            // Wake on change to ON
+            esp_sleep_enable_ext0_wakeup(GPIO_NUM_13,1);
+            rtc_gpio_pullup_dis( GPIO_NUM_13);
+            rtc_gpio_pulldown_en( GPIO_NUM_13);
+        }
+
+        // Don't sleep if checking for OTA!
+        if(!_bCheckForOTA)
+        {
+            Serial.println(F("Sleep"));
+            esp_deep_sleep_start();
+        }
+    }
+}
+
+// END SLEEP
+
 void do_send(osjob_t* j){
     // Payload to send (uplink)
     // PID,ITEMNO,STATE,TRIGGER,COUNT
-    static uint8_t message[] = "ttgo,1,1,1,0";
 
     // Check if there is not a current TX/RX job running
     if (LMIC.opmode & OP_TXRXPEND) {
@@ -105,7 +169,7 @@ void do_send(osjob_t* j){
         uint64_t chipid=ESP.getEfuseMac();//The chip ID is essentially its MAC address(length: 6 bytes).
 
         sprintf(_buff, "ttgo,%llx,%d,%d,%d", chipid,state_on,_wakeup_reason,_triggerCount);
-              
+
         // Prepare upstream data transmission at the next possible time.
         LMIC_setTxData2(1, (unsigned char *)&_buff, strlen(_buff), 0);
         Serial.println(F("Sending uplink packet..."));
@@ -125,24 +189,47 @@ void onEvent (ev_t ev) {
             }
 
             if (LMIC.dataLen) {
-              int i = 0;
               // data received in rx slot after tx
               Serial.print(F("Data Received: "));
               Serial.write(LMIC.frame+LMIC.dataBeg, LMIC.dataLen);
               Serial.println();
               Serial.println(LMIC.rssi);
 
-                // For now any downlink message flashes the LED and clears the counters
-                _triggerCount = 0;
+              u1_t port = LMIC.frame[LMIC.dataBeg-1];                 // get the port number
 
-                // Flash LED...
-                for(int i = 0; i < 5; i++)
-                {
-                    digitalWrite(LEDPIN, HIGH);
-                    delay(250);
-                    digitalWrite(LEDPIN, LOW);
-                    delay(250);
-                }
+              switch(port)
+              {
+                    case 1 :
+                    
+                        // Downlink message on port 1 flashes the LED and clears the counters
+                        _triggerCount = 0;
+
+                        // Flash LED...
+                        for(int i = 0; i < 5; i++)
+                        {
+                            digitalWrite(LEDPIN, HIGH);
+                            delay(250);
+                            digitalWrite(LEDPIN, LOW);
+                            delay(250);
+                        }
+                        break;
+                
+                    case 2 :
+
+                        // If we don't send a LoRa packet and instead reset, which at the moment causes us to rejoin
+                        // then TTN keeps sending the same packet???
+                        // For now just let it resend and we'll check twice. The second time we won't have an update
+                        // so will just sleep and continue on...
+
+                        // Downlink message on port 2 causes a firmware update on DoESLiverpool SSID
+                        // TODO: Add parsing of SSID, Password configuration from LoRa packet
+                        _bCheckForOTA = false;
+                        if (setupOTA(WIFI_SSID, WIFI_PASS))
+                        {
+                            _bCheckForOTA = true;
+                        }
+                        break;
+              }
             }
 
             // Copy across our structure to NVRAM backed storage
@@ -150,7 +237,6 @@ void onEvent (ev_t ev) {
 
             digitalWrite(LEDPIN, LOW);
 
-            Serial.println(F("Sleep"));
             pinMode(LEDPIN,INPUT);
 
             // Schedule next transmission
@@ -164,30 +250,8 @@ void onEvent (ev_t ev) {
             esp_deep_sleep_start();
 #endif
 
-            // Wake up on sleep timer
-            esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+            gotosleep();
 
-            // Wake up on switch change
-            {
-                int switchValue = digitalRead(SWITCHPIN);
-                bool state = switchValue == 1;
-                
-                if(state)
-                {
-                    // Wake on change to OFF
-                    esp_sleep_enable_ext0_wakeup(GPIO_NUM_13,0);
-                    rtc_gpio_pulldown_dis( GPIO_NUM_13);
-                    rtc_gpio_pullup_en( GPIO_NUM_13);
-                }
-                else
-                {
-                    // Wake on change to ON
-                    esp_sleep_enable_ext0_wakeup(GPIO_NUM_13,1);
-                    rtc_gpio_pullup_dis( GPIO_NUM_13);
-                    rtc_gpio_pulldown_en( GPIO_NUM_13);
-                }
-                esp_deep_sleep_start();
-            }
             break;
         case EV_JOINING:
             Serial.println(F("EV_JOINING: -> Joining..."));
@@ -196,7 +260,7 @@ void onEvent (ev_t ev) {
               Serial.println(F("EV_JOINED"));
 
               _isJoined = true;
-              
+
               // Copy across our structure to NVRAM backed storage
               memcpy( (void *)&_lmic, (const void *)&LMIC, sizeof(LMIC));
 
@@ -223,14 +287,12 @@ void onEvent (ev_t ev) {
 }
 
 void setup() {
-    esp_err_t ret;
-    uint8_t sensor_data_h, sensor_data_l;
 
     // We were using this for RTC sleep wakeup... (maybe)
     // Button
-    rtc_gpio_deinit(GPIO_NUM_0); 
+    rtc_gpio_deinit(GPIO_NUM_0);
     // Switch
-    rtc_gpio_deinit(GPIO_NUM_13); 
+    rtc_gpio_deinit(GPIO_NUM_13);
 
     Serial.begin(115200);
     delay(2500);                      // Give time to the serial monitor to pick up
@@ -247,6 +309,10 @@ void setup() {
 
     // Update DevEUI
     memcpy_P(DEVEUI,(const void *)&chipID, sizeof(uint64_t));
+
+    // Firmware version
+    Serial.print("Device f/w version: v.");
+    Serial.println(VERSION);
 
     // Get wakeup reason (might only be able to do this once after start?)
     _wakeup_reason = esp_sleep_get_wakeup_cause();
@@ -276,30 +342,6 @@ void setup() {
     Serial.print("SwitchValue: ");
     Serial.println(switchValue);
 
-    // Wifi - was intending to pull acc. data from a phone app but we won't be doing this now.
-#if 0
-    int count = 20;
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED && count--) {
-        delay(500);
-        display.clear();
-        display.drawString(0,0,"Connecting to WiFi..");
-        display.display();
-    } 
-    display.clear();
-    if(WiFi.status() == WL_CONNECTED) {
-        display.drawString(0,0,"Connected !!!");
-    }
-    else{
-        display.drawString(0,0,"Error Connecting to WiFi !!!");
-    }
-    display.display();
-    delay(3000);
-
-    int stat;
-    int acc[3];
-#endif
-
     // LMIC init
     os_init();
 
@@ -316,7 +358,6 @@ void setup() {
     // configures the minimal channel set.
 
     LMIC_setupChannel(0, 868100000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
-    /*
     LMIC_setupChannel(1, 868300000, DR_RANGE_MAP(DR_SF12, DR_SF7B), BAND_CENTI);      // g-band
     LMIC_setupChannel(2, 868500000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
     LMIC_setupChannel(3, 867100000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
@@ -325,7 +366,6 @@ void setup() {
     LMIC_setupChannel(6, 867700000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
     LMIC_setupChannel(7, 867900000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
     LMIC_setupChannel(8, 868800000, DR_RANGE_MAP(DR_FSK,  DR_FSK),  BAND_MILLI);      // g2-band
-*/
 
     // TTN defines an additional channel at 869.525Mhz using SF9 for class B
     // devices' ping slots. LMIC does not have an easy way to define set this
@@ -336,13 +376,12 @@ void setup() {
     LMIC_setLinkCheckMode(0);
 
     // TTN uses SF9 for its RX2 window.
-//    LMIC.dn2Dr = DR_SF9;
-    LMIC.dn2Dr = DR_SF7;
+    LMIC.dn2Dr = DR_SF9;
 
     // Set data rate and transmit power for uplink (note: txpow seems to be ignored by the library)
     //LMIC_setDrTxpow(DR_SF11,14);
     //  LMIC_setDrTxpow(DR_SF9,14);
-    LMIC_setDrTxpow(DR_SF7,14);
+    LMIC_setDrTxpow(DR_SF12,14);
 
     if(_isJoined)
     {
@@ -357,5 +396,23 @@ void setup() {
 }
 
 void loop() {
-    os_runloop_once();
+    if(_bCheckForOTA)
+    {
+        // Checking for OTA - TODO: add timeout
+        if ((millis() - OTA_CHECK_INTERVAL) > _lastOTACheck) {
+            _lastOTACheck = millis();
+            if(checkFirmwareUpdates() == 0)
+            {
+                _bCheckForOTA = false;
+                
+                // Successful check but no new firmware available - go to sleep
+                gotosleep();
+            }
+        }
+    }
+    else
+    {
+        // Normal operation
+        os_runloop_once();
+    }
 }

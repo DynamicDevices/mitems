@@ -13,6 +13,20 @@
             "problemMatcher": [
                 "$platformio"
             ]
+        },
+        {
+            "type": "PlatformIO",
+            "task": "Build",
+            "problemMatcher": [
+                "$platformio"
+            ]
+        },
+        {
+            "type": "PlatformIO",
+            "task": "Upload",
+            "problemMatcher": [
+                "$platformio"
+            ]
         }
     ]
 }
